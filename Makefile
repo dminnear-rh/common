@@ -433,6 +433,24 @@ super-linter: ## Runs super linter locally
 					-w /tmp/lint \
 					ghcr.io/super-linter/super-linter:slim-v7
 
+.PHONY: install
+install: operator-deploy post-install ## installs the pattern and loads the secrets
+	@echo "Installed"
+
+.PHONY: post-install
+post-install: ## Post-install tasks
+	make load-secrets
+	@echo "Done"
+
+.PHONY: test
+test: ## run schema validation tests using PATTERN_OPTS
+	$(eval MAIN_CLUSTERGROUP := $(shell yq '.main.clusterGroupName' values-global.yaml))
+	$(eval MAIN_CLUSTERGROUP_FILE := values-$(MAIN_CLUSTERGROUP).yaml)
+	$(eval PATTERN_OPTS ?= -f values-global.yaml -f $(MAIN_CLUSTERGROUP_FILE))
+	@echo -n "Validating clustergroup schema with pattern options: "
+	@set -e; helm template oci://quay.io/hybridcloudpatterns/clustergroup $(HELM_OPTS) $(PATTERN_OPTS) >/dev/null
+	@echo "OK"
+
 .PHONY: deploy upgrade legacy-deploy legacy-upgrade
 deploy upgrade legacy-deploy legacy-upgrade:
 	@echo "UNSUPPORTED TARGET: please switch to 'operator-deploy'"; exit 1
