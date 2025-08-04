@@ -7,7 +7,7 @@ endif
 # Set this to true if you want to skip any origin validation
 DISABLE_VALIDATE_ORIGIN ?= false
 ifeq ($(DISABLE_VALIDATE_ORIGIN),true)
-  VALIDATE_ORIGIN := 
+  VALIDATE_ORIGIN :=
 else
   VALIDATE_ORIGIN := validate-origin
 endif
@@ -62,6 +62,39 @@ PATTERN_INSTALL_CHART ?= oci://quay.io/hybridcloudpatterns/pattern-install
 
 ##@ Pattern Common Tasks
 
+.PHONY: argocd-login
+argocd-login: ## Login to validated patterns argocd instances
+	@ARGOCD_NAMESPACES=$$(oc get argoCD -A -o jsonpath='{.items[*].metadata.namespace}'); \
+	if [ -z "$$ARGOCD_NAMESPACES" ]; then \
+		echo "Error: No Argo CD instances found in the cluster."; \
+		exit 1; \
+	fi; \
+	NAMESPACES=($$ARGOCD_NAMESPACES); \
+	if [ $${#NAMESPACES[@]} -lt 2 ]; then \
+		echo "Error: Less than two Argo CD instances found. Found instances in namespaces: $$ARGOCD_NAMESPACES"; \
+		exit 1; \
+	fi; \
+	for NAMESPACE in $${NAMESPACES[@]}; do \
+		ARGOCD_INSTANCE=$$(oc get argocd -n "$$NAMESPACE" -o jsonpath='{.items[0].metadata.name}'); \
+		SERVER_URL=$$(oc get route "$$ARGOCD_INSTANCE"-server -n "$$NAMESPACE" -o jsonpath='{.status.ingress[0].host}'); \
+		PASSWORD=$$(oc get secret "$$ARGOCD_INSTANCE"-cluster -n "$$NAMESPACE" -o jsonpath='{.data.admin\.password}' | base64 -d); \
+		echo $$PASSWORD; \
+		argocd login --skip-test-tls --insecure --grpc-web "$$SERVER_URL" --username "admin" --password "$$PASSWORD"; \
+		if [ "$$?" -ne 0 ]; then \
+			echo "Login to Argo CD $$SERVER_URL failed. Exiting."; \
+			exit 1; \
+		fi; \
+	done
+
+.PHONY: display-secrets-info
+display-secrets-info: ## Display information about secrets configuration
+	$(eval SECRETS_BACKING_STORE := $(shell yq '.global.secretStore.backend' values-global.yaml 2>/dev/null || echo "vault"))
+	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" -e secrets_backing_store="$(SECRETS_BACKING_STORE)" -e hide_sensitive_output=false $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.display_secrets_info"
+
+.PHONY: load-k8s-secrets
+load-k8s-secrets: ## Load secrets into Kubernetes backend
+	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.k8s_secrets"
+
 .PHONY: help
 help: ## This help message
 	@echo "Pattern: $(NAME)"
@@ -75,15 +108,106 @@ show: ## show the starting template without installing it
 
 preview-all: ## (EXPERIMENTAL) Previews all applications on hub and managed clusters
 	@echo "NOTE: This is just a tentative approximation of rendering all hub and managed clusters templates"
-	@common/scripts/preview-all.sh $(TARGET_REPO) $(TARGET_BRANCH)
+	$(eval HUB := $(shell yq ".main.clusterGroupName" values-global.yaml))
+	$(eval MANAGED_CLUSTERS := $(shell yq ".clusterGroup.managedClusterGroups.[].name" values-$(HUB).yaml))
+	$(eval ALL_CLUSTERS := $(HUB) $(MANAGED_CLUSTERS))
+	@CLUSTER_INFO_OUT=$$(oc cluster-info 2>&1); \
+	CLUSTER_INFO_RET=$$?; \
+	if [ $$CLUSTER_INFO_RET -ne 0 ]; then \
+		echo "Could not access the cluster:"; \
+		echo "$$CLUSTER_INFO_OUT"; \
+		exit 1; \
+	fi; \
+	for cluster in $(ALL_CLUSTERS); do \
+		APPS="clustergroup $$(yq ".clusterGroup.applications.[].name" values-$$cluster.yaml)"; \
+		for app in $$APPS; do \
+			printf "# Parsing application $$app from cluster $$cluster\n"; \
+			$(MAKE) preview-$$app CLUSTERGROUP=$$cluster TARGET_REPO=$(TARGET_REPO) TARGET_BRANCH=$(TARGET_BRANCH); \
+		done; \
+	done
 
 preview-%:
 	$(eval CLUSTERGROUP ?= $(shell yq ".main.clusterGroupName" values-global.yaml))
-	@common/scripts/preview.sh $(CLUSTERGROUP) $* $(TARGET_REPO) $(TARGET_BRANCH)
+	$(eval SITE := $(CLUSTERGROUP))
+	$(eval APPNAME := $*)
+	$(eval GIT_REPO := $(TARGET_REPO))
+	$(eval GIT_BRANCH := $(TARGET_BRANCH))
+	@if [ "$(APPNAME)" != "clustergroup" ]; then \
+		APP=$$(yq ".clusterGroup.applications | with_entries(select(.value.name == \"$(APPNAME)\")) | keys | .[0]" values-$(SITE).yaml); \
+		isLocalHelmChart=$$(yq ".clusterGroup.applications.$$APP.path" values-$(SITE).yaml); \
+		if [ $$isLocalHelmChart != "null" ]; then \
+			chart=$$(yq ".clusterGroup.applications.$$APP.path" values-$(SITE).yaml); \
+		else \
+			helmrepo=$$(yq ".clusterGroup.applications.$$APP.repoURL" values-$(SITE).yaml); \
+			helmrepo="$${helmrepo:+oci://quay.io/hybridcloudpatterns}"; \
+			chartversion=$$(yq ".clusterGroup.applications.$$APP.chartVersion" values-$(SITE).yaml); \
+			chartname=$$(yq ".clusterGroup.applications.$$APP.chart" values-$(SITE).yaml); \
+			chart="$$helmrepo/$$chartname --version $$chartversion"; \
+		fi; \
+		namespace=$$(yq ".clusterGroup.applications.$$APP.namespace" values-$(SITE).yaml); \
+	else \
+		APP=$(APPNAME); \
+		clusterGroupChartVersion=$$(yq ".main.multiSourceConfig.clusterGroupChartVersion" values-global.yaml); \
+		helmrepo="oci://quay.io/hybridcloudpatterns"; \
+		chart="$$helmrepo/clustergroup --version $$clusterGroupChartVersion"; \
+		namespace="openshift-operators"; \
+	fi; \
+	pattern=$$(yq ".global.pattern" values-global.yaml); \
+	platform=$${OCP_PLATFORM:-$$(oc get Infrastructure.config.openshift.io/cluster -o jsonpath='{.spec.platformSpec.type}')}; \
+	ocpversion=$${OCP_VERSION:-$$(oc get clusterversion/version -o jsonpath='{.status.desired.version}' | awk -F. '{print $$1"."$$2}')}; \
+	domain=$${OCP_DOMAIN:-$$(oc get Ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}' | sed 's/^apps.//')}; \
+	CLUSTER_OPTS="--set global.pattern=$$pattern --set global.repoURL=$(GIT_REPO) --set main.git.repoURL=$(GIT_REPO) --set main.git.revision=$(GIT_BRANCH) --set global.namespace=$$namespace --set global.hubClusterDomain=apps.$$domain --set global.localClusterDomain=apps.$$domain --set global.clusterDomain=$$domain --set global.clusterVersion=$$ocpversion --set global.clusterPlatform=$$platform"; \
+	VALUE_FILES="-f values-global.yaml -f values-$(SITE).yaml"; \
+	sharedValueFiles=$$(yq ".clusterGroup.sharedValueFiles" values-$(SITE).yaml); \
+	appValueFiles=$$(yq ".clusterGroup.applications.$$APP.extraValueFiles" values-$(SITE).yaml); \
+	for line in $$sharedValueFiles; do \
+		if [ "$$line" != "null" ] && [ -f "$$line" ]; then \
+			file=$$(echo "$$line" | sed -e 's/ //g' -e 's/\$$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$$domain/g"); \
+			VALUE_FILES="$$VALUE_FILES -f $(PWD)/$$file"; \
+		fi; \
+	done; \
+	for line in $$appValueFiles; do \
+		if [ "$$line" != "null" ] && [ -f "$$line" ]; then \
+			file=$$(echo "$$line" | sed -e 's/ //g' -e 's/\$$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$$domain/g"); \
+			VALUE_FILES="$$VALUE_FILES -f $(PWD)/$$file"; \
+		fi; \
+	done; \
+	isKustomize=$$(yq ".clusterGroup.applications.$$APP.kustomize" values-$(SITE).yaml); \
+	overrides=$$(yq ".clusterGroup.applications.$$APP.overrides[]" "values-$(SITE).yaml" 2>/dev/null | tr -d '\n' | sed -e 's/name:/ --set/g; s/value: /=/g'); \
+	if [ "$$isKustomize" == "true" ]; then \
+		kustomizePath=$$(yq ".clusterGroup.applications.$$APP.path" values-$(SITE).yaml); \
+		repoURL=$$(yq ".clusterGroup.applications.$$APP.repoURL" values-$(SITE).yaml); \
+		if [[ $$repoURL == http* ]] || [[ $$repoURL == git@ ]]; then \
+			kustomizePath="$$repoURL/$$kustomizePath"; \
+		fi; \
+		oc kustomize $$kustomizePath; \
+	else \
+		helm template $$chart --name-template $$APP -n $$namespace $$VALUE_FILES $$overrides $$CLUSTER_OPTS; \
+	fi
 
 .PHONY: operator-deploy
 operator-deploy operator-upgrade: validate-prereq $(VALIDATE_ORIGIN) validate-cluster ## runs helm install
-	@common/scripts/deploy-pattern.sh $(NAME) $(PATTERN_INSTALL_CHART) $(HELM_OPTS)
+	@RUNS=10; \
+	WAIT=15; \
+	echo -n "Installing pattern: "; \
+	for i in $$(seq 1 $$RUNS); do \
+		exec 3>&1 4>&2; \
+		OUT=$$( { helm template --include-crds --name-template $(NAME) $(PATTERN_INSTALL_CHART) $(HELM_OPTS) 2>&4 | oc apply -f- 2>&4 1>&3; } 4>&1 3>&1); \
+		ret=$$?; \
+		exec 3>&- 4>&-; \
+		if [ $$ret -eq 0 ]; then \
+			break; \
+		else \
+			echo -n "."; \
+			sleep "$$WAIT"; \
+		fi; \
+	done; \
+	if [ $$i -eq $$RUNS ]; then \
+		echo "Installation failed [$$i/$$RUNS]. Error:"; \
+		echo "$$OUT"; \
+		exit 1; \
+	fi; \
+	echo "Done"
 
 .PHONY: uninstall
 uninstall: ## runs helm uninstall
@@ -93,34 +217,82 @@ uninstall: ## runs helm uninstall
 
 .PHONY: load-secrets
 load-secrets: ## loads the secrets into the backend determined by values-global setting
-	common/scripts/process-secrets.sh $(NAME)
+	$(eval SECRETS_BACKING_STORE := $(shell yq '.global.secretStore.backend' values-global.yaml 2>/dev/null || echo "vault"))
+	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" -e secrets_backing_store="$(SECRETS_BACKING_STORE)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.process_secrets"
 
 .PHONY: legacy-load-secrets
 legacy-load-secrets: ## loads the secrets into vault (only)
-	common/scripts/vault-utils.sh push_secrets $(NAME)
+	ansible-playbook -t "push_secrets" -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.vault"
 
 .PHONY: secrets-backend-vault
 secrets-backend-vault: ## Edits values files to use default Vault+ESO secrets config
-	common/scripts/set-secret-backend.sh vault
-	common/scripts/manage-secret-app.sh vault present
-	common/scripts/manage-secret-app.sh golang-external-secrets present
-	common/scripts/manage-secret-namespace.sh validated-patterns-secrets absent
+	yq -i '.global.secretStore.backend = "vault"' values-global.yaml
+	$(eval MAIN_CLUSTERGROUP := $(shell yq '.main.clusterGroupName' values-global.yaml))
+	$(eval MAIN_CLUSTERGROUP_FILE := values-$(MAIN_CLUSTERGROUP).yaml)
+	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets"))' "$(MAIN_CLUSTERGROUP_FILE)"
+	@RES=$$(yq '.clusterGroup.applications[] | select(.chart == "hashicorp-vault")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
+	if [ -z "$$RES" ]; then \
+		echo "Adding vault application"; \
+		yq -i '.clusterGroup.applications.vault = {"name": "vault", "namespace": "vault", "project": "$(MAIN_CLUSTERGROUP)", "chart": "hashicorp-vault", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	fi
+	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "vault")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
+	if [ -z "$$RES" ]; then \
+		echo "Adding vault namespace"; \
+		yq -i '.clusterGroup.namespaces += ["vault"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	fi
+	@RES=$$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
+	if [ -z "$$RES" ]; then \
+		echo "Adding golang-external-secrets application"; \
+		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "$(MAIN_CLUSTERGROUP)", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	fi
+	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
+	if [ -z "$$RES" ]; then \
+		echo "Adding golang-external-secrets namespace"; \
+		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	fi
 	@git diff --exit-code || echo "Secrets backend set to vault, please review changes, commit, and push to activate in the pattern"
 
 .PHONY: secrets-backend-kubernetes
 secrets-backend-kubernetes: ## Edits values file to use Kubernetes+ESO secrets config
-	common/scripts/set-secret-backend.sh kubernetes
-	common/scripts/manage-secret-namespace.sh validated-patterns-secrets present
-	common/scripts/manage-secret-app.sh vault absent
-	common/scripts/manage-secret-app.sh golang-external-secrets present
+	yq -i '.global.secretStore.backend = "kubernetes"' values-global.yaml
+	$(eval MAIN_CLUSTERGROUP := $(shell yq '.main.clusterGroupName' values-global.yaml))
+	$(eval MAIN_CLUSTERGROUP_FILE := values-$(MAIN_CLUSTERGROUP).yaml)
+	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
+	if [ -z "$$RES" ]; then \
+		echo "Adding validated-patterns-secrets namespace"; \
+		yq -i '.clusterGroup.namespaces += ["validated-patterns-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	fi
+	@echo "Removing vault application"
+	@yq -i 'del(.clusterGroup.applications[] | select(.chart == "hashicorp-vault"))' "$(MAIN_CLUSTERGROUP_FILE)"
+	@echo "Removing vault namespace"
+	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "vault"))' "$(MAIN_CLUSTERGROUP_FILE)"
+	@RES=$$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
+	if [ -z "$$RES" ]; then \
+		echo "Adding golang-external-secrets application"; \
+		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "$(MAIN_CLUSTERGROUP)", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	fi
+	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
+	if [ -z "$$RES" ]; then \
+		echo "Adding golang-external-secrets namespace"; \
+		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	fi
 	@git diff --exit-code || echo "Secrets backend set to kubernetes, please review changes, commit, and push to activate in the pattern"
 
 .PHONY: secrets-backend-none
 secrets-backend-none: ## Edits values files to remove secrets manager + ESO
-	common/scripts/set-secret-backend.sh none
-	common/scripts/manage-secret-app.sh vault absent
-	common/scripts/manage-secret-app.sh golang-external-secrets absent
-	common/scripts/manage-secret-namespace.sh validated-patterns-secrets absent
+	yq -i '.global.secretStore.backend = "none"' values-global.yaml
+	$(eval MAIN_CLUSTERGROUP := $(shell yq '.main.clusterGroupName' values-global.yaml))
+	$(eval MAIN_CLUSTERGROUP_FILE := values-$(MAIN_CLUSTERGROUP).yaml)
+	@echo "Removing vault application"
+	@yq -i 'del(.clusterGroup.applications[] | select(.chart == "hashicorp-vault"))' "$(MAIN_CLUSTERGROUP_FILE)"
+	@echo "Removing golang-external-secrets application"
+	@yq -i 'del(.clusterGroup.applications[] | select(.chart == "golang-external-secrets"))' "$(MAIN_CLUSTERGROUP_FILE)"
+	@echo "Removing validated-patterns-secrets namespace"
+	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets"))' "$(MAIN_CLUSTERGROUP_FILE)"
+	@echo "Removing vault namespace"
+	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "vault"))' "$(MAIN_CLUSTERGROUP_FILE)"
+	@echo "Removing golang-external-secrets namespace"
+	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "golang-external-secrets"))' "$(MAIN_CLUSTERGROUP_FILE)"
 	@git diff --exit-code || echo "Secrets backend set to none, please review changes, commit, and push to activate in the pattern"
 
 .PHONY: load-iib
@@ -134,7 +306,7 @@ load-iib: ## CI target to install Index Image Bundles
 
 .PHONY: token-kubeconfig
 token-kubeconfig: ## Create a local ~/.kube/config with password (not usually needed)
-	common/scripts/write-token-kubeconfig.sh
+	ansible-playbook -e pattern_dir="$(PWD)" -e kubeconfig_file="~/.kube/config" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.write-token-kubeconfig"
 
 ##@ Validation Tasks
 
