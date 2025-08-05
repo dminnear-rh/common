@@ -1,3 +1,5 @@
+.ONESHELL:
+
 NAME ?= $(shell basename "`pwd`")
 
 ifneq ($(origin TARGET_SITE), undefined)
@@ -49,12 +51,20 @@ endif
 TOKEN_SECRET ?=
 TOKEN_NAMESPACE ?=
 
+HELM_OPTS := -f values-global.yaml
+HELM_OPTS += --set main.git.revision=$(TARGET_BRANCH)
+HELM_OPTS += $(TARGET_SITE_OPT)
+HELM_OPTS += $(UUID_HELM_OPTS)
+HELM_OPTS += $(EXTRA_HELM_OPTS)
+
 ifeq ($(TOKEN_SECRET),)
-  HELM_OPTS=-f values-global.yaml --set main.git.repoURL="$(TARGET_REPO)" --set main.git.revision=$(TARGET_BRANCH) $(TARGET_SITE_OPT) $(UUID_HELM_OPTS) $(EXTRA_HELM_OPTS)
+  HELM_OPTS += --set main.git.repoURL="$(TARGET_REPO)"
 else
   # When we are working with a private repository we do not escape the git URL as it might be using an ssh secret which does not use https://
   TARGET_CLEAN_REPO=$(shell git ls-remote --get-url --symref $(TARGET_ORIGIN))
-  HELM_OPTS=-f values-global.yaml --set main.tokenSecret=$(TOKEN_SECRET) --set main.tokenSecretNamespace=$(TOKEN_NAMESPACE) --set main.git.repoURL="$(TARGET_CLEAN_REPO)" --set main.git.revision=$(TARGET_BRANCH) $(TARGET_SITE_OPT) $(UUID_HELM_OPTS) $(EXTRA_HELM_OPTS)
+  HELM_OPTS += --set main.tokenSecret=$(TOKEN_SECRET)
+  HELM_OPTS += --set main.tokenSecretNamespace=$(TOKEN_NAMESPACE)
+  HELM_OPTS += --set main.git.repoURL="$(TARGET_CLEAN_REPO)"
 endif
 
 # Helm does the right thing and fetches all the tags and detects the newest one
@@ -64,26 +74,26 @@ PATTERN_INSTALL_CHART ?= oci://quay.io/hybridcloudpatterns/pattern-install
 
 .PHONY: argocd-login
 argocd-login: ## Login to validated patterns argocd instances
-	@ARGOCD_NAMESPACES=$$(oc get argoCD -A -o jsonpath='{.items[*].metadata.namespace}'); \
-	if [ -z "$$ARGOCD_NAMESPACES" ]; then \
-		echo "Error: No Argo CD instances found in the cluster."; \
-		exit 1; \
-	fi; \
-	NAMESPACES=($$ARGOCD_NAMESPACES); \
-	if [ $${#NAMESPACES[@]} -lt 2 ]; then \
-		echo "Error: Less than two Argo CD instances found. Found instances in namespaces: $$ARGOCD_NAMESPACES"; \
-		exit 1; \
-	fi; \
-	for NAMESPACE in $${NAMESPACES[@]}; do \
-		ARGOCD_INSTANCE=$$(oc get argocd -n "$$NAMESPACE" -o jsonpath='{.items[0].metadata.name}'); \
-		SERVER_URL=$$(oc get route "$$ARGOCD_INSTANCE"-server -n "$$NAMESPACE" -o jsonpath='{.status.ingress[0].host}'); \
-		PASSWORD=$$(oc get secret "$$ARGOCD_INSTANCE"-cluster -n "$$NAMESPACE" -o jsonpath='{.data.admin\.password}' | base64 -d); \
-		echo $$PASSWORD; \
-		argocd login --skip-test-tls --insecure --grpc-web "$$SERVER_URL" --username "admin" --password "$$PASSWORD"; \
-		if [ "$$?" -ne 0 ]; then \
-			echo "Login to Argo CD $$SERVER_URL failed. Exiting."; \
-			exit 1; \
-		fi; \
+	@ARGOCD_NAMESPACES=$(oc get argoCD -A -o jsonpath='{.items[*].metadata.namespace}')
+	if [ -z "$ARGOCD_NAMESPACES" ]; then
+		echo "Error: No Argo CD instances found in the cluster."
+		exit 1
+	fi
+	NAMESPACES=($ARGOCD_NAMESPACES)
+	if [ ${#NAMESPACES[@]} -lt 2 ]; then
+		echo "Error: Less than two Argo CD instances found. Found instances in namespaces: $ARGOCD_NAMESPACES"
+		exit 1
+	fi
+	for NAMESPACE in ${NAMESPACES[@]}; do
+		ARGOCD_INSTANCE=$(oc get argocd -n "$NAMESPACE" -o jsonpath='{.items[0].metadata.name}')
+		SERVER_URL=$(oc get route "$ARGOCD_INSTANCE"-server -n "$NAMESPACE" -o jsonpath='{.status.ingress[0].host}')
+		PASSWORD=$(oc get secret "$ARGOCD_INSTANCE"-cluster -n "$NAMESPACE" -o jsonpath='{.data.admin\.password}' | base64 -d)
+		echo $PASSWORD
+		argocd login --skip-test-tls --insecure --grpc-web "$SERVER_URL" --username "admin" --password "$PASSWORD"
+		if [ "$?" -ne 0 ]; then
+			echo "Login to Argo CD $SERVER_URL failed. Exiting."
+			exit 1
+		fi
 	done
 
 .PHONY: display-secrets-info
@@ -111,19 +121,19 @@ preview-all: ## (EXPERIMENTAL) Previews all applications on hub and managed clus
 	$(eval HUB := $(shell yq ".main.clusterGroupName" values-global.yaml))
 	$(eval MANAGED_CLUSTERS := $(shell yq ".clusterGroup.managedClusterGroups.[].name" values-$(HUB).yaml))
 	$(eval ALL_CLUSTERS := $(HUB) $(MANAGED_CLUSTERS))
-	@CLUSTER_INFO_OUT=$$(oc cluster-info 2>&1); \
-	CLUSTER_INFO_RET=$$?; \
-	if [ $$CLUSTER_INFO_RET -ne 0 ]; then \
-		echo "Could not access the cluster:"; \
-		echo "$$CLUSTER_INFO_OUT"; \
-		exit 1; \
-	fi; \
-	for cluster in $(ALL_CLUSTERS); do \
-		APPS="clustergroup $$(yq ".clusterGroup.applications.[].name" values-$$cluster.yaml)"; \
-		for app in $$APPS; do \
-			printf "# Parsing application $$app from cluster $$cluster\n"; \
-			$(MAKE) preview-$$app CLUSTERGROUP=$$cluster TARGET_REPO=$(TARGET_REPO) TARGET_BRANCH=$(TARGET_BRANCH); \
-		done; \
+	@CLUSTER_INFO_OUT=$(oc cluster-info 2>&1)
+	CLUSTER_INFO_RET=$?
+	if [ $CLUSTER_INFO_RET -ne 0 ]; then
+		echo "Could not access the cluster:"
+		echo "$CLUSTER_INFO_OUT"
+		exit 1
+	fi
+	for cluster in $(ALL_CLUSTERS); do
+		APPS="clustergroup $(yq ".clusterGroup.applications.[].name" values-$cluster.yaml)"
+		for app in $APPS; do
+			printf "# Parsing application $app from cluster $cluster\n"
+			$(MAKE) preview-$app CLUSTERGROUP=$cluster TARGET_REPO=$(TARGET_REPO) TARGET_BRANCH=$(TARGET_BRANCH)
+		done
 	done
 
 preview-%:
@@ -132,81 +142,88 @@ preview-%:
 	$(eval APPNAME := $*)
 	$(eval GIT_REPO := $(TARGET_REPO))
 	$(eval GIT_BRANCH := $(TARGET_BRANCH))
-	@if [ "$(APPNAME)" != "clustergroup" ]; then \
-		APP=$$(yq ".clusterGroup.applications | with_entries(select(.value.name == \"$(APPNAME)\")) | keys | .[0]" values-$(SITE).yaml); \
-		isLocalHelmChart=$$(yq ".clusterGroup.applications.$$APP.path" values-$(SITE).yaml); \
-		if [ $$isLocalHelmChart != "null" ]; then \
-			chart=$$(yq ".clusterGroup.applications.$$APP.path" values-$(SITE).yaml); \
-		else \
-			helmrepo=$$(yq ".clusterGroup.applications.$$APP.repoURL" values-$(SITE).yaml); \
-			helmrepo="$${helmrepo:+oci://quay.io/hybridcloudpatterns}"; \
-			chartversion=$$(yq ".clusterGroup.applications.$$APP.chartVersion" values-$(SITE).yaml); \
-			chartname=$$(yq ".clusterGroup.applications.$$APP.chart" values-$(SITE).yaml); \
-			chart="$$helmrepo/$$chartname --version $$chartversion"; \
-		fi; \
-		namespace=$$(yq ".clusterGroup.applications.$$APP.namespace" values-$(SITE).yaml); \
-	else \
-		APP=$(APPNAME); \
-		clusterGroupChartVersion=$$(yq ".main.multiSourceConfig.clusterGroupChartVersion" values-global.yaml); \
-		helmrepo="oci://quay.io/hybridcloudpatterns"; \
-		chart="$$helmrepo/clustergroup --version $$clusterGroupChartVersion"; \
-		namespace="openshift-operators"; \
-	fi; \
-	pattern=$$(yq ".global.pattern" values-global.yaml); \
-	platform=$${OCP_PLATFORM:-$$(oc get Infrastructure.config.openshift.io/cluster -o jsonpath='{.spec.platformSpec.type}')}; \
-	ocpversion=$${OCP_VERSION:-$$(oc get clusterversion/version -o jsonpath='{.status.desired.version}' | awk -F. '{print $$1"."$$2}')}; \
-	domain=$${OCP_DOMAIN:-$$(oc get Ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}' | sed 's/^apps.//')}; \
-	CLUSTER_OPTS="--set global.pattern=$$pattern --set global.repoURL=$(GIT_REPO) --set main.git.repoURL=$(GIT_REPO) --set main.git.revision=$(GIT_BRANCH) --set global.namespace=$$namespace --set global.hubClusterDomain=apps.$$domain --set global.localClusterDomain=apps.$$domain --set global.clusterDomain=$$domain --set global.clusterVersion=$$ocpversion --set global.clusterPlatform=$$platform"; \
-	VALUE_FILES="-f values-global.yaml -f values-$(SITE).yaml"; \
-	sharedValueFiles=$$(yq ".clusterGroup.sharedValueFiles" values-$(SITE).yaml); \
-	appValueFiles=$$(yq ".clusterGroup.applications.$$APP.extraValueFiles" values-$(SITE).yaml); \
-	for line in $$sharedValueFiles; do \
-		if [ "$$line" != "null" ] && [ -f "$$line" ]; then \
-			file=$$(echo "$$line" | sed -e 's/ //g' -e 's/\$$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$$domain/g"); \
-			VALUE_FILES="$$VALUE_FILES -f $(PWD)/$$file"; \
-		fi; \
-	done; \
-	for line in $$appValueFiles; do \
-		if [ "$$line" != "null" ] && [ -f "$$line" ]; then \
-			file=$$(echo "$$line" | sed -e 's/ //g' -e 's/\$$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$$domain/g"); \
-			VALUE_FILES="$$VALUE_FILES -f $(PWD)/$$file"; \
-		fi; \
-	done; \
-	isKustomize=$$(yq ".clusterGroup.applications.$$APP.kustomize" values-$(SITE).yaml); \
-	overrides=$$(yq ".clusterGroup.applications.$$APP.overrides[]" "values-$(SITE).yaml" 2>/dev/null | tr -d '\n' | sed -e 's/name:/ --set/g; s/value: /=/g'); \
-	if [ "$$isKustomize" == "true" ]; then \
-		kustomizePath=$$(yq ".clusterGroup.applications.$$APP.path" values-$(SITE).yaml); \
-		repoURL=$$(yq ".clusterGroup.applications.$$APP.repoURL" values-$(SITE).yaml); \
-		if [[ $$repoURL == http* ]] || [[ $$repoURL == git@ ]]; then \
-			kustomizePath="$$repoURL/$$kustomizePath"; \
-		fi; \
-		oc kustomize $$kustomizePath; \
-	else \
-		helm template $$chart --name-template $$APP -n $$namespace $$VALUE_FILES $$overrides $$CLUSTER_OPTS; \
+	@if [ "$(APPNAME)" != "clustergroup" ]; then
+		APP=$(yq ".clusterGroup.applications | with_entries(select(.value.name == \"$(APPNAME)\")) | keys | .[0]" values-$(SITE).yaml)
+		isLocalHelmChart=$(yq ".clusterGroup.applications.$APP.path" values-$(SITE).yaml)
+		if [ $isLocalHelmChart != "null" ]; then
+			chart=$(yq ".clusterGroup.applications.$APP.path" values-$(SITE).yaml)
+		else
+			helmrepo=$(yq ".clusterGroup.applications.$APP.repoURL" values-$(SITE).yaml)
+			helmrepo="${helmrepo:+oci://quay.io/hybridcloudpatterns}"
+			chartversion=$(yq ".clusterGroup.applications.$APP.chartVersion" values-$(SITE).yaml)
+			chartname=$(yq ".clusterGroup.applications.$APP.chart" values-$(SITE).yaml)
+			chart="$helmrepo/$chartname --version $chartversion"
+		fi
+		namespace=$(yq ".clusterGroup.applications.$APP.namespace" values-$(SITE).yaml)
+	else
+		APP=$(APPNAME)
+		clusterGroupChartVersion=$(yq ".main.multiSourceConfig.clusterGroupChartVersion" values-global.yaml)
+		helmrepo="oci://quay.io/hybridcloudpatterns"
+		chart="$helmrepo/clustergroup --version $clusterGroupChartVersion"
+		namespace="openshift-operators"
+	fi
+	pattern=$(yq ".global.pattern" values-global.yaml)
+	platform=${OCP_PLATFORM:-$(oc get Infrastructure.config.openshift.io/cluster -o jsonpath='{.spec.platformSpec.type}')}
+	ocpversion=${OCP_VERSION:-$(oc get clusterversion/version -o jsonpath='{.status.desired.version}' | awk -F. '{print $1"."$2}')}
+	domain=${OCP_DOMAIN:-$(oc get Ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}' | sed 's/^apps.//')}
+	CLUSTER_OPTS="--set global.pattern=$pattern"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set global.repoURL=$(GIT_REPO)"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set main.git.repoURL=$(GIT_REPO)"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set main.git.revision=$(GIT_BRANCH)"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set global.namespace=$namespace"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set global.hubClusterDomain=apps.$domain"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set global.localClusterDomain=apps.$domain"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set global.clusterDomain=$domain"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set global.clusterVersion=$ocpversion"
+	CLUSTER_OPTS="$CLUSTER_OPTS --set global.clusterPlatform=$platform"
+	VALUE_FILES="-f values-global.yaml -f values-$(SITE).yaml"
+	sharedValueFiles=$(yq ".clusterGroup.sharedValueFiles" values-$(SITE).yaml)
+	appValueFiles=$(yq ".clusterGroup.applications.$APP.extraValueFiles" values-$(SITE).yaml)
+	for line in $sharedValueFiles; do
+		if [ "$line" != "null" ] && [ -f "$line" ]; then
+			file=$(echo "$line" | sed -e 's/ //g' -e 's/\$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$domain/g")
+			VALUE_FILES="$VALUE_FILES -f $(PWD)/$file"
+		fi
+	done
+	for line in $appValueFiles; do
+		if [ "$line" != "null" ] && [ -f "$line" ]; then
+			file=$(echo "$line" | sed -e 's/ //g' -e 's/\$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$domain/g")
+			VALUE_FILES="$VALUE_FILES -f $(PWD)/$file"
+		fi
+	done
+	isKustomize=$(yq ".clusterGroup.applications.$APP.kustomize" values-$(SITE).yaml)
+	overrides=$(yq ".clusterGroup.applications.$APP.overrides[]" "values-$(SITE).yaml" 2>/dev/null | tr -d '\n' | sed -e 's/name:/ --set/g; s/value: /=/g')
+	if [ "$isKustomize" == "true" ]; then
+		kustomizePath=$(yq ".clusterGroup.applications.$APP.path" values-$(SITE).yaml)
+		repoURL=$(yq ".clusterGroup.applications.$APP.repoURL" values-$(SITE).yaml)
+		if [[ $repoURL == http* ]] || [[ $repoURL == git@ ]]; then
+			kustomizePath="$repoURL/$kustomizePath"
+		fi
+		oc kustomize $kustomizePath
+	else
+		helm template $chart --name-template $APP -n $namespace $VALUE_FILES $overrides $CLUSTER_OPTS
 	fi
 
 .PHONY: operator-deploy
 operator-deploy operator-upgrade: validate-prereq $(VALIDATE_ORIGIN) validate-cluster ## runs helm install
-	@RUNS=10; \
-	WAIT=15; \
-	echo -n "Installing pattern: "; \
-	for i in $$(seq 1 $$RUNS); do \
-		exec 3>&1 4>&2; \
-		OUT=$$( { helm template --include-crds --name-template $(NAME) $(PATTERN_INSTALL_CHART) $(HELM_OPTS) 2>&4 | oc apply -f- 2>&4 1>&3; } 4>&1 3>&1); \
-		ret=$$?; \
-		exec 3>&- 4>&-; \
-		if [ $$ret -eq 0 ]; then \
-			break; \
-		else \
-			echo -n "."; \
-			sleep "$$WAIT"; \
-		fi; \
-	done; \
-	if [ $$i -eq $$RUNS ]; then \
-		echo "Installation failed [$$i/$$RUNS]. Error:"; \
-		echo "$$OUT"; \
-		exit 1; \
-	fi; \
+	@RUNS=10
+	WAIT=15
+	echo -n "Installing pattern: "
+	for i in $(seq 1 $RUNS); do
+		OUT=$(helm template --include-crds --name-template $(NAME) $(PATTERN_INSTALL_CHART) $(HELM_OPTS) 2>&1 | oc apply -f- 2>&1)
+		ret=$?
+		if [ $ret -eq 0 ]; then
+			break
+		else
+			echo -n "."
+			sleep "$WAIT"
+		fi
+	done
+	if [ $i -eq $RUNS ]; then
+		echo "Installation failed [$i/$RUNS]. Error:"
+		echo "$OUT"
+		exit 1
+	fi
 	echo "Done"
 
 .PHONY: uninstall
@@ -230,25 +247,25 @@ secrets-backend-vault: ## Edits values files to use default Vault+ESO secrets co
 	$(eval MAIN_CLUSTERGROUP := $(shell yq '.main.clusterGroupName' values-global.yaml))
 	$(eval MAIN_CLUSTERGROUP_FILE := values-$(MAIN_CLUSTERGROUP).yaml)
 	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets"))' "$(MAIN_CLUSTERGROUP_FILE)"
-	@RES=$$(yq '.clusterGroup.applications[] | select(.chart == "hashicorp-vault")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
-	if [ -z "$$RES" ]; then \
-		echo "Adding vault application"; \
-		yq -i '.clusterGroup.applications.vault = {"name": "vault", "namespace": "vault", "project": "$(MAIN_CLUSTERGROUP)", "chart": "hashicorp-vault", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	@RES=$(yq '.clusterGroup.applications[] | select(.chart == "hashicorp-vault")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null)
+	if [ -z "$RES" ]; then
+		echo "Adding vault application"
+		yq -i '.clusterGroup.applications.vault = {"name": "vault", "namespace": "vault", "project": "$(MAIN_CLUSTERGROUP)", "chart": "hashicorp-vault", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"
 	fi
-	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "vault")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
-	if [ -z "$$RES" ]; then \
-		echo "Adding vault namespace"; \
-		yq -i '.clusterGroup.namespaces += ["vault"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "vault")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null)
+	if [ -z "$RES" ]; then
+		echo "Adding vault namespace"
+		yq -i '.clusterGroup.namespaces += ["vault"]' "$(MAIN_CLUSTERGROUP_FILE)"
 	fi
-	@RES=$$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
-	if [ -z "$$RES" ]; then \
-		echo "Adding golang-external-secrets application"; \
-		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "$(MAIN_CLUSTERGROUP)", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	@RES=$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null)
+	if [ -z "$RES" ]; then
+		echo "Adding golang-external-secrets application"
+		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "$(MAIN_CLUSTERGROUP)", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"
 	fi
-	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
-	if [ -z "$$RES" ]; then \
-		echo "Adding golang-external-secrets namespace"; \
-		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null)
+	if [ -z "$RES" ]; then
+		echo "Adding golang-external-secrets namespace"
+		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"
 	fi
 	@git diff --exit-code || echo "Secrets backend set to vault, please review changes, commit, and push to activate in the pattern"
 
@@ -257,24 +274,24 @@ secrets-backend-kubernetes: ## Edits values file to use Kubernetes+ESO secrets c
 	yq -i '.global.secretStore.backend = "kubernetes"' values-global.yaml
 	$(eval MAIN_CLUSTERGROUP := $(shell yq '.main.clusterGroupName' values-global.yaml))
 	$(eval MAIN_CLUSTERGROUP_FILE := values-$(MAIN_CLUSTERGROUP).yaml)
-	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
-	if [ -z "$$RES" ]; then \
-		echo "Adding validated-patterns-secrets namespace"; \
-		yq -i '.clusterGroup.namespaces += ["validated-patterns-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null)
+	if [ -z "$RES" ]; then
+		echo "Adding validated-patterns-secrets namespace"
+		yq -i '.clusterGroup.namespaces += ["validated-patterns-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"
 	fi
 	@echo "Removing vault application"
 	@yq -i 'del(.clusterGroup.applications[] | select(.chart == "hashicorp-vault"))' "$(MAIN_CLUSTERGROUP_FILE)"
 	@echo "Removing vault namespace"
 	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "vault"))' "$(MAIN_CLUSTERGROUP_FILE)"
-	@RES=$$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
-	if [ -z "$$RES" ]; then \
-		echo "Adding golang-external-secrets application"; \
-		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "$(MAIN_CLUSTERGROUP)", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	@RES=$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null)
+	if [ -z "$RES" ]; then
+		echo "Adding golang-external-secrets application"
+		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "$(MAIN_CLUSTERGROUP)", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$(MAIN_CLUSTERGROUP_FILE)"
 	fi
-	@RES=$$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null); \
-	if [ -z "$$RES" ]; then \
-		echo "Adding golang-external-secrets namespace"; \
-		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"; \
+	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$(MAIN_CLUSTERGROUP_FILE)" 2>/dev/null)
+	if [ -z "$RES" ]; then
+		echo "Adding golang-external-secrets namespace"
+		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$(MAIN_CLUSTERGROUP_FILE)"
 	fi
 	@git diff --exit-code || echo "Secrets backend set to kubernetes, please review changes, commit, and push to activate in the pattern"
 
@@ -297,11 +314,12 @@ secrets-backend-none: ## Edits values files to remove secrets manager + ESO
 
 .PHONY: load-iib
 load-iib: ## CI target to install Index Image Bundles
-	@set -e; if [ x$(INDEX_IMAGES) != x ]; then \
-		ansible-playbook $(EXTRA_PLAYBOOK_OPTS) rhvp.cluster_utils.iib_ci; \
-	else \
-		echo "No INDEX_IMAGES defined. Bailing out"; \
-		exit 1; \
+	@set -e
+	if [ x$(INDEX_IMAGES) != x ]; then
+		ansible-playbook $(EXTRA_PLAYBOOK_OPTS) rhvp.cluster_utils.iib_ci
+	else
+		echo "No INDEX_IMAGES defined. Bailing out"
+		exit 1
 	fi
 
 .PHONY: token-kubeconfig
@@ -318,15 +336,13 @@ token-kubeconfig: ## Create a local ~/.kube/config with password (not usually ne
 validate-origin: ## verify the git origin is available
 	@echo "Checking repository:"
 	$(eval UPSTREAMURL := $(shell yq -r '.main.git.repoUpstreamURL // (.main.git.repoUpstreamURL = "")' values-global.yaml))
-	@if [ -z "$(UPSTREAMURL)" ]; then\
-		echo -n "  $(TARGET_REPO) - branch '$(TARGET_BRANCH)': ";\
-		git ls-remote --exit-code --heads $(TARGET_REPO) $(TARGET_BRANCH) >/dev/null &&\
-			echo "OK" || (echo "NOT FOUND"; exit 1);\
-	else\
-		echo "Upstream URL set to: $(UPSTREAMURL)";\
-		echo -n "  $(UPSTREAMURL) - branch '$(TARGET_BRANCH)': ";\
-		git ls-remote --exit-code --heads $(UPSTREAMURL) $(TARGET_BRANCH) >/dev/null &&\
-			echo "OK" || (echo "NOT FOUND"; exit 1);\
+	@if [ -z "$(UPSTREAMURL)" ]; then
+		echo -n "  $(TARGET_REPO) - branch '$(TARGET_BRANCH)': "
+		git ls-remote --exit-code --heads $(TARGET_REPO) $(TARGET_BRANCH) >/dev/null && echo "OK" || (echo "NOT FOUND"; exit 1)
+	else
+		echo "Upstream URL set to: $(UPSTREAMURL)"
+		echo -n "  $(UPSTREAMURL) - branch '$(TARGET_BRANCH)': "
+		git ls-remote --exit-code --heads $(UPSTREAMURL) $(TARGET_BRANCH) >/dev/null && echo "OK" || (echo "NOT FOUND"; exit 1)
 	fi
 
 .PHONY: validate-cluster
@@ -335,10 +351,10 @@ validate-cluster: ## Do some cluster validations before installing
 	@echo -n "  cluster-info: "
 	@oc cluster-info >/dev/null && echo "OK" || (echo "Error"; exit 1)
 	@echo -n "  storageclass: "
-	@if [ `oc get storageclass -o go-template='{{printf "%d\n" (len .items)}}'` -eq 0 ]; then\
-		echo "WARNING: No storageclass found";\
-	else\
-		echo "OK";\
+	@if [ `oc get storageclass -o go-template='{{printf "%d\n" (len .items)}}'` -eq 0 ]; then
+		echo "WARNING: No storageclass found"
+	else
+		echo "OK"
 	fi
 
 
@@ -346,58 +362,62 @@ validate-cluster: ## Do some cluster validations before installing
 validate-schema: ## validates values files against schema in common/clustergroup
 	$(eval VAL_PARAMS := $(shell for i in ./values-*.yaml; do echo -n "$${i} "; done))
 	@echo -n "Validating clustergroup schema of: "
-	@set -e; for i in $(VAL_PARAMS); do echo -n " $$i"; helm template oci://quay.io/hybridcloudpatterns/clustergroup $(HELM_OPTS) -f "$${i}" >/dev/null; done
+	@set -e
+	for i in $(VAL_PARAMS); do
+		echo -n " $i"
+		helm template oci://quay.io/hybridcloudpatterns/clustergroup $(HELM_OPTS) -f "$i" >/dev/null
+	done
 	@echo
 
 .PHONY: validate-prereq
 validate-prereq: ## verify pre-requisites
 	$(eval GLOBAL_PATTERN := $(shell yq -r .global.pattern values-global.yaml))
-	@if [ $(NAME) != $(GLOBAL_PATTERN) ]; then\
-		echo "";\
-		echo "WARNING: folder directory is \"$(NAME)\" and global.pattern is set to \"$(GLOBAL_PATTERN)\"";\
-		echo "this can create problems. Please make sure they are the same!";\
-		echo "";\
+	@if [ $(NAME) != $(GLOBAL_PATTERN) ]; then
+		echo ""
+		echo "WARNING: folder directory is \"$(NAME)\" and global.pattern is set to \"$(GLOBAL_PATTERN)\""
+		echo "this can create problems. Please make sure they are the same!"
+		echo ""
 	fi
-	@if [ ! -f /run/.containerenv ]; then\
-	  echo "Checking prerequisites:";\
-	  echo -n "  Check for python-kubernetes: ";\
-	  if ! ansible -m ansible.builtin.command -a "{{ ansible_python_interpreter }} -c 'import kubernetes'" localhost > /dev/null 2>&1; then echo "Not found"; exit 1; fi;\
-	  echo "OK";\
-	  echo -n "  Check for kubernetes.core collection: ";\
-	  if ! ansible-galaxy collection list | grep kubernetes.core > /dev/null 2>&1; then echo "Not found"; exit 1; fi;\
-	  echo "OK";\
-	else\
-		if [ -f values-global.yaml ]; then\
-			OUT=`yq -r '.main.multiSourceConfig.enabled // (.main.multiSourceConfig.enabled = "false")' values-global.yaml`;\
-			if [ "$${OUT,,}" = "false" ]; then\
-				echo "You must set \".main.multiSourceConfig.enabled: true\" in your 'values-global.yaml' file";\
-				echo "because your common subfolder is the slimmed down version with no helm charts in it";\
-				exit 1;\
-			fi;\
-		fi;\
+	@if [ ! -f /run/.containerenv ]; then
+		echo "Checking prerequisites:"
+		echo -n "  Check for python-kubernetes: "
+		if ! ansible -m ansible.builtin.command -a "{{ ansible_python_interpreter }} -c 'import kubernetes'" localhost > /dev/null 2>&1; then echo "Not found"; exit 1; fi
+		echo "OK"
+		echo -n "  Check for kubernetes.core collection: "
+		if ! ansible-galaxy collection list | grep kubernetes.core > /dev/null 2>&1; then echo "Not found"; exit 1; fi
+		echo "OK"
+	else
+		if [ -f values-global.yaml ]; then
+			OUT=`yq -r '.main.multiSourceConfig.enabled // (.main.multiSourceConfig.enabled = "false")' values-global.yaml`
+			if [ "${OUT,,}" = "false" ]; then
+				echo "You must set \".main.multiSourceConfig.enabled: true\" in your 'values-global.yaml' file"
+				echo "because your common subfolder is the slimmed down version with no helm charts in it"
+				exit 1
+			fi
+		fi
 	fi
 
 .PHONY: argo-healthcheck
 argo-healthcheck: ## Checks if all argo applications are synced
 	@echo "Checking argo applications"
 	$(eval APPS := $(shell oc get applications.argoproj.io -A -o jsonpath='{range .items[*]}{@.metadata.namespace}{","}{@.metadata.name}{"\n"}{end}'))
-	@NOTOK=0; \
-	for i in $(APPS); do\
-		n=`echo "$${i}" | cut -f1 -d,`;\
-		a=`echo "$${i}" | cut -f2 -d,`;\
-		STATUS=`oc get -n "$${n}" applications.argoproj.io/"$${a}" -o jsonpath='{.status.sync.status}'`;\
-		if [[ $$STATUS != "Synced" ]]; then\
-			NOTOK=$$(( $${NOTOK} + 1));\
-		fi;\
-		HEALTH=`oc get -n "$${n}" applications.argoproj.io/"$${a}" -o jsonpath='{.status.health.status}'`;\
-		if [[ $$HEALTH != "Healthy" ]]; then\
-			NOTOK=$$(( $${NOTOK} + 1));\
-		fi;\
-		echo "$${n} $${a} -> Sync: $${STATUS} - Health: $${HEALTH}";\
-	done;\
-	if [ $${NOTOK} -gt 0 ]; then\
-	    echo "Some applications are not synced or are unhealthy";\
-	    exit 1;\
+	@NOTOK=0
+	for i in $(APPS); do
+		n=`echo "$i" | cut -f1 -d,`
+		a=`echo "$i" | cut -f2 -d,`
+		STATUS=`oc get -n "$n" applications.argoproj.io/"$a" -o jsonpath='{.status.sync.status}'`
+		if [[ $STATUS != "Synced" ]]; then
+			NOTOK=$(( $NOTOK + 1))
+		fi
+		HEALTH=`oc get -n "$n" applications.argoproj.io/"$a" -o jsonpath='{.status.health.status}'`
+		if [[ $HEALTH != "Healthy" ]]; then
+			NOTOK=$(( $NOTOK + 1))
+		fi
+		echo "$n $a -> Sync: $STATUS - Health: $HEALTH"
+	done
+	if [ $NOTOK -gt 0 ]; then
+	    echo "Some applications are not synced or are unhealthy"
+	    exit 1
 	fi
 
 
@@ -405,16 +425,19 @@ argo-healthcheck: ## Checks if all argo applications are synced
 
 .PHONY: qe-tests
 qe-tests: ## Runs the tests that QE runs
-	@set -e; if [ -f ./tests/interop/run_tests.sh ]; then \
-		pushd ./tests/interop; ./run_tests.sh; popd; \
-	else \
-		echo "No ./tests/interop/run_tests.sh found skipping"; \
+	@set -e
+	if [ -f ./tests/interop/run_tests.sh ]; then
+		pushd ./tests/interop
+		./run_tests.sh
+		popd
+	else
+		echo "No ./tests/interop/run_tests.sh found skipping"
 	fi
 
 .PHONY: super-linter
 super-linter: ## Runs super linter locally
 	rm -rf .mypy_cache
-	podman run -e RUN_LOCAL=true -e USE_FIND_ALGORITHM=true	\
+	podman run -e RUN_LOCAL=true -e USE_FIND_ALGORITHM=true \
 					-e VALIDATE_ANSIBLE=false \
 					-e VALIDATE_BASH=false \
 					-e VALIDATE_CHECKOV=false \
