@@ -1,6 +1,6 @@
 .ONESHELL:
 
-NAME ?= $(shell basename "`pwd`")
+NAME ?= $(shell basename "$(pwd)")
 
 ifneq ($(origin TARGET_SITE), undefined)
   TARGET_SITE_OPT=--set main.clusterGroupName=$(TARGET_SITE)
@@ -357,7 +357,7 @@ validate-cluster: ## Do some cluster validations before installing
 	@echo -n "  cluster-info: "
 	@oc cluster-info >/dev/null && echo "OK" || (echo "Error"; exit 1)
 	@echo -n "  storageclass: "
-	@if [ `oc get storageclass -o go-template='{{printf "%d\n" (len .items)}}'` -eq 0 ]; then
+	@if [ $(oc get storageclass -o go-template='{{printf "%d\n" (len .items)}}') -eq 0 ]; then
 		echo "WARNING: No storageclass found"
 	else
 		echo "OK"
@@ -394,7 +394,7 @@ validate-prereq: ## Verify pre-requisites
 		echo "OK"
 	else
 		if [ -f values-global.yaml ]; then
-			OUT=`yq -r '.main.multiSourceConfig.enabled // (.main.multiSourceConfig.enabled = "false")' values-global.yaml`
+			OUT=$(yq -r '.main.multiSourceConfig.enabled // (.main.multiSourceConfig.enabled = "false")' values-global.yaml)
 			if [ "${OUT,,}" = "false" ]; then
 				echo "You must set \".main.multiSourceConfig.enabled: true\" in your 'values-global.yaml' file"
 				echo "because your common subfolder is the slimmed down version with no helm charts in it"
@@ -409,13 +409,13 @@ argo-healthcheck: ## Checks if all argo applications are synced
 	APPS=$(oc get applications.argoproj.io -A -o jsonpath='{range .items[*]}{@.metadata.namespace}{","}{@.metadata.name}{"\n"}{end}')
 	@NOTOK=0
 	for i in $APPS; do
-		n=`echo "$i" | cut -f1 -d,`
-		a=`echo "$i" | cut -f2 -d,`
-		STATUS=`oc get -n "$n" applications.argoproj.io/"$a" -o jsonpath='{.status.sync.status}'`
+		n=$(echo "$i" | cut -f1 -d,)
+		a=$(echo "$i" | cut -f2 -d,)
+		STATUS=$(oc get -n "$n" applications.argoproj.io/"$a" -o jsonpath='{.status.sync.status}')
 		if [[ $STATUS != "Synced" ]]; then
 			NOTOK=$(( $NOTOK + 1))
 		fi
-		HEALTH=`oc get -n "$n" applications.argoproj.io/"$a" -o jsonpath='{.status.health.status}'`
+		HEALTH=$(oc get -n "$n" applications.argoproj.io/"$a" -o jsonpath='{.status.health.status}')
 		if [[ $HEALTH != "Healthy" ]]; then
 			NOTOK=$(( $NOTOK + 1))
 		fi
