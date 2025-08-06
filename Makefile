@@ -1,6 +1,7 @@
 .ONESHELL:
 
-NAME ?= $(shell basename "$(PWD)")
+NAME ?= $(shell basename $(CURDIR))
+PATTERN_DIR ?= $(CURDIR)
 
 ifneq ($(origin TARGET_SITE), undefined)
   TARGET_SITE_OPT=--set main.clusterGroupName=$(TARGET_SITE)
@@ -12,6 +13,11 @@ ifeq ($(DISABLE_VALIDATE_ORIGIN),true)
   VALIDATE_ORIGIN :=
 else
   VALIDATE_ORIGIN := validate-origin
+endif
+
+SECRETS_BACKING_STORE ?= $(shell yq '.global.secretStore.backend' values-global.yaml 2>/dev/null)
+ifeq ($(SECRETS_BACKING_STORE),null)
+  SECRETS_BACKING_STORE=vault
 endif
 
 # This variable can be set in order to pass additional helm arguments from the
@@ -98,12 +104,13 @@ argocd-login: ## Login to validated patterns argocd instances
 
 .PHONY: token-kubeconfig
 token-kubeconfig: ## Create a local ~/.kube/config with password (not usually needed)
-	ansible-playbook -e pattern_dir="$(PWD)" -e kubeconfig_file="~/.kube/config" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.write-token-kubeconfig"
+	ansible-playbook -e pattern_dir="$(PATTERN_DIR)" -e kubeconfig_file="~/.kube/config" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.write_token_kubeconfig"
 
 .PHONY: help
 help: ## This help message
 	@echo "Pattern: $(NAME)"
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^(\s|[a-zA-Z_0-9-])+:.*?##/ { printf "  \033[36m%-35s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	echo "Pattern Dir: $(PATTERN_DIR)"
+	awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^(\s|[a-zA-Z_0-9-])+:.*?##/ { printf "  \033[36m%-35s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Preview and Template Tasks
 
@@ -111,94 +118,99 @@ help: ## This help message
 #  e.g. from industrial-edge: make -f common/Makefile show
 .PHONY: show
 show: ## Show the starting template without installing it
-	helm template $(PATTERN_INSTALL_CHART) --name-template $(NAME) $(HELM_OPTS)
+	@helm template $(PATTERN_INSTALL_CHART) --name-template $(NAME) $(HELM_OPTS) 2>/dev/null
 
 preview-all: ## (EXPERIMENTAL) Previews all applications on hub and managed clusters
 	@echo "NOTE: This is just a tentative approximation of rendering all hub and managed clusters templates"
-	HUB=$(yq ".main.clusterGroupName" values-global.yaml)
-	MANAGED_CLUSTERS=$(yq ".clusterGroup.managedClusterGroups.[].name" values-$HUB.yaml)
-	ALL_CLUSTERS="$HUB $MANAGED_CLUSTERS"
-	@CLUSTER_INFO_OUT=$(oc cluster-info 2>&1)
-	CLUSTER_INFO_RET=$?
-	if [ $CLUSTER_INFO_RET -ne 0 ]; then
+	HUB=$$(yq ".main.clusterGroupName" values-global.yaml)
+	MANAGED_CLUSTERS=$$(yq ".clusterGroup.managedClusterGroups.[].name" "values-$$HUB.yaml")
+	ALL_CLUSTERS="$$HUB $$MANAGED_CLUSTERS"
+	CLUSTER_INFO_OUT=$$(oc cluster-info 2>&1)
+	CLUSTER_INFO_RET=$$?
+	if [ $$CLUSTER_INFO_RET -ne 0 ]; then
 		echo "Could not access the cluster:"
-		echo "$CLUSTER_INFO_OUT"
+		echo "$$CLUSTER_INFO_OUT"
 		exit 1
 	fi
-	for cluster in $ALL_CLUSTERS; do
-		APPS="clustergroup $(yq ".clusterGroup.applications.[].name" values-$cluster.yaml)"
-		for app in $APPS; do
-			printf "# Parsing application $app from cluster $cluster\n"
-			$(MAKE) preview-$app CLUSTERGROUP=$cluster TARGET_REPO=$(TARGET_REPO) TARGET_BRANCH=$(TARGET_BRANCH)
+	for cluster in $$ALL_CLUSTERS; do
+		APPS="clustergroup $$(yq -r '.clusterGroup.applications.[].name | select(. != null)' "values-$$cluster.yaml" 2>/dev/null)"
+		for app in $$APPS; do
+			printf "\n# Parsing application $$app from cluster $$cluster\n"
+			$(MAKE) -s --no-print-directory preview-$$app CLUSTERGROUP="$$cluster" TARGET_REPO="$(TARGET_REPO)" TARGET_BRANCH="$(TARGET_BRANCH)" 2>/dev/null
 		done
 	done
 
 preview-%:
-	CLUSTERGROUP=${CLUSTERGROUP:-$(yq ".main.clusterGroupName" values-global.yaml)}
-	SITE=$CLUSTERGROUP
-	APPNAME=$*
-	GIT_REPO=$(TARGET_REPO)
-	GIT_BRANCH=$(TARGET_BRANCH)
-	@if [ "$APPNAME" != "clustergroup" ]; then
-		APP=$(yq ".clusterGroup.applications | with_entries(select(.value.name == \"$APPNAME\")) | keys | .[0]" values-$SITE.yaml)
-		isLocalHelmChart=$(yq ".clusterGroup.applications.$APP.path" values-$SITE.yaml)
-		if [ $isLocalHelmChart != "null" ]; then
-			chart=$(yq ".clusterGroup.applications.$APP.path" values-$SITE.yaml)
+	SITE='$(CLUSTERGROUP)'
+	APPNAME='$*'
+	GIT_REPO='$(TARGET_REPO)'
+	GIT_BRANCH='$(TARGET_BRANCH)'
+
+	if [ "$$APPNAME" != "clustergroup" ]; then
+		APP=$$(yq -r ".clusterGroup.applications | with_entries(select(.value.name == \"$$APPNAME\")) | keys | .[0]" "values-$$SITE.yaml")
+		isLocalHelmChart=$$(yq -r ".clusterGroup.applications.$$APP.path" "values-$$SITE.yaml")
+		if [ "$$isLocalHelmChart" != "null" ]; then
+			chart=$$(yq -r ".clusterGroup.applications.$$APP.path" "values-$$SITE.yaml")
 		else
-			helmrepo=$(yq ".clusterGroup.applications.$APP.repoURL" values-$SITE.yaml)
-			helmrepo="${helmrepo:+oci://quay.io/hybridcloudpatterns}"
-			chartversion=$(yq ".clusterGroup.applications.$APP.chartVersion" values-$SITE.yaml)
-			chartname=$(yq ".clusterGroup.applications.$APP.chart" values-$SITE.yaml)
-			chart="$helmrepo/$chartname --version $chartversion"
+			helmrepo=$$(yq -r ".clusterGroup.applications.$$APP.repoURL" "values-$$SITE.yaml")
+			helmrepo="$${helmrepo:+oci://quay.io/hybridcloudpatterns}"
+			chartversion=$$(yq -r ".clusterGroup.applications.$$APP.chartVersion" "values-$$SITE.yaml")
+			chartname=$$(yq -r ".clusterGroup.applications.$$APP.chart" "values-$$SITE.yaml")
+			chart="$$helmrepo/$$chartname --version $$chartversion"
 		fi
-		namespace=$(yq ".clusterGroup.applications.$APP.namespace" values-$SITE.yaml)
+		namespace=$$(yq -r ".clusterGroup.applications.$$APP.namespace" "values-$$SITE.yaml")
 	else
-		APP=$APPNAME
-		clusterGroupChartVersion=$(yq ".main.multiSourceConfig.clusterGroupChartVersion" values-global.yaml)
+		APP="$$APPNAME"
+		clusterGroupChartVersion=$$(yq -r ".main.multiSourceConfig.clusterGroupChartVersion" values-global.yaml)
 		helmrepo="oci://quay.io/hybridcloudpatterns"
-		chart="$helmrepo/clustergroup --version $clusterGroupChartVersion"
+		chart="$$helmrepo/clustergroup --version $$clusterGroupChartVersion"
 		namespace="openshift-operators"
 	fi
-	pattern=$(yq ".global.pattern" values-global.yaml)
-	platform=${OCP_PLATFORM:-$(oc get Infrastructure.config.openshift.io/cluster -o jsonpath='{.spec.platformSpec.type}')}
-	ocpversion=${OCP_VERSION:-$(oc get clusterversion/version -o jsonpath='{.status.desired.version}' | awk -F. '{print $1"."$2}')}
-	domain=${OCP_DOMAIN:-$(oc get Ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}' | sed 's/^apps.//')}
-	CLUSTER_OPTS="--set global.pattern=$pattern"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set global.repoURL=$GIT_REPO"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set main.git.repoURL=$GIT_REPO"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set main.git.revision=$GIT_BRANCH"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set global.namespace=$namespace"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set global.hubClusterDomain=apps.$domain"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set global.localClusterDomain=apps.$domain"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set global.clusterDomain=$domain"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set global.clusterVersion=$ocpversion"
-	CLUSTER_OPTS="$CLUSTER_OPTS --set global.clusterPlatform=$platform"
-	VALUE_FILES="-f values-global.yaml -f values-$SITE.yaml"
-	sharedValueFiles=$(yq ".clusterGroup.sharedValueFiles" values-$SITE.yaml)
-	appValueFiles=$(yq ".clusterGroup.applications.$APP.extraValueFiles" values-$SITE.yaml)
-	for line in $sharedValueFiles; do
-		if [ "$line" != "null" ] && [ -f "$line" ]; then
-			file=$(echo "$line" | sed -e 's/ //g' -e 's/\$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$domain/g")
-			VALUE_FILES="$VALUE_FILES -f $(PWD)/$file"
+	pattern=$$(yq -r ".global.pattern" values-global.yaml)
+	platform="$${OCP_PLATFORM:-$$(oc get Infrastructure.config.openshift.io/cluster -o jsonpath='{.spec.platformSpec.type}')}"
+	ocpversion="$${OCP_VERSION:-$$(oc get clusterversion/version -o jsonpath='{.status.desired.version}' | awk -F. '{print $$1"."$$2}')}"
+	domain="$${OCP_DOMAIN:-$$(oc get Ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}' | sed 's/^apps.//')}"
+	CLUSTER_OPTS="--set global.pattern=$$pattern"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set global.repoURL=$$GIT_REPO"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set main.git.repoURL=$$GIT_REPO"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set main.git.revision=$$GIT_BRANCH"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set global.namespace=$$namespace"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set global.hubClusterDomain=apps.$$domain"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set global.localClusterDomain=apps.$$domain"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set global.clusterDomain=$$domain"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set global.clusterVersion=$$ocpversion"
+	CLUSTER_OPTS="$$CLUSTER_OPTS --set global.clusterPlatform=$$platform"
+	VALUE_FILES="-f values-global.yaml -f values-$$SITE.yaml"
+	sharedValueFiles=$$(yq -r '.clusterGroup.sharedValueFiles | select(. != null) | .[]' "values-$$SITE.yaml" 2>/dev/null)
+	appValueFiles=$$(yq -r ".clusterGroup.applications.$$APP.extraValueFiles | select(. != null) | .[]" "values-$$SITE.yaml" 2>/dev/null)
+
+	# This loop now correctly mimics the original script's 'replaceGlobals' function.
+	for line in $$sharedValueFiles; do
+		# This pipeline first removes quotes and normalizes the template syntax,
+		# then it substitutes the platform, version, and domain variables.
+		file=$$(echo "$$line" | sed -e "s/'//g" -e 's/\$.Values/.Values/g' -e "s/{{.Values.global.clusterPlatform}}/$$platform/g" -e "s/{{.Values.global.clusterVersion}}/$$ocpversion/g" -e "s/{{.Values.global.clusterDomain}}/$$domain/g")
+		if [ -f "$$file" ]; then
+			VALUE_FILES="$$VALUE_FILES -f $$file"
 		fi
 	done
-	for line in $appValueFiles; do
-		if [ "$line" != "null" ] && [ -f "$line" ]; then
-			file=$(echo "$line" | sed -e 's/ //g' -e 's/\$//g' -e 's/^-//g' -e "s/'//g" | sed "s/{{.Values.global.clusterPlatform}}/$platform/g" | sed "s/{{.Values.global.clusterVersion}}/$ocpversion/g" | sed "s/{{.Values.global.clusterDomain}}/$domain/g")
-			VALUE_FILES="$VALUE_FILES -f $(PWD)/$file"
+	for line in $$appValueFiles; do
+		file=$$(echo "$$line" | sed -e "s/'//g" -e 's/\$.Values/.Values/g' -e "s/{{.Values.global.clusterPlatform}}/$$platform/g" -e "s/{{.Values.global.clusterVersion}}/$$ocpversion/g" -e "s/{{.Values.global.clusterDomain}}/$$domain/g")
+		if [ -f "$$file" ]; then
+			VALUE_FILES="$$VALUE_FILES -f $$file"
 		fi
 	done
-	isKustomize=$(yq ".clusterGroup.applications.$APP.kustomize" values-$SITE.yaml)
-	overrides=$(yq ".clusterGroup.applications.$APP.overrides[]" "values-$SITE.yaml" 2>/dev/null | tr -d '\n' | sed -e 's/name:/ --set/g; s/value: /=/g')
-	if [ "$isKustomize" == "true" ]; then
-		kustomizePath=$(yq ".clusterGroup.applications.$APP.path" values-$SITE.yaml)
-		repoURL=$(yq ".clusterGroup.applications.$APP.repoURL" values-$SITE.yaml)
-		if [[ $repoURL == http* ]] || [[ $repoURL == git@ ]]; then
-			kustomizePath="$repoURL/$kustomizePath"
+
+	isKustomize=$$(yq -r ".clusterGroup.applications.$$APP.kustomize" "values-$$SITE.yaml")
+	overrides=$$(yq -r ".clusterGroup.applications.$$APP.overrides[] | select(. != null)" "values-$$SITE.yaml" 2>/dev/null | tr -d '\n' | sed -e 's/name:/ --set/g; s/value: /=/g')
+	if [ "$$isKustomize" == "true" ]; then
+		kustomizePath=$$(yq -r ".clusterGroup.applications.$$APP.path" "values-$$SITE.yaml")
+		repoURL=$$(yq -r ".clusterGroup.applications.$$APP.repoURL" "values-$$SITE.yaml")
+		if [[ "$$repoURL" == http* ]] || [[ "$$repoURL" == git@* ]]; then
+			kustomizePath="$$repoURL/$$kustomizePath"
 		fi
-		oc kustomize $kustomizePath
+		oc kustomize "$$kustomizePath"
 	else
-		helm template $chart --name-template $APP -n $namespace $VALUE_FILES $overrides $CLUSTER_OPTS
+		helm template $$chart --name-template $$APP -n $$namespace $$VALUE_FILES $$overrides $$CLUSTER_OPTS
 	fi
 
 ##@ Installation and Deployment Tasks
@@ -244,21 +256,21 @@ post-install: ## Post-install tasks
 
 .PHONY: display-secrets-info
 display-secrets-info: ## Display information about secrets configuration
-	SECRETS_BACKING_STORE=$(yq '.global.secretStore.backend' values-global.yaml 2>/dev/null || echo "vault")
-	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" -e secrets_backing_store="$SECRETS_BACKING_STORE" -e hide_sensitive_output=false $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.display_secrets_info"
+# 	SECRETS_BACKING_STORE=$$(yq -e '.global.secretStore.backend' values-global.yaml 2>/dev/null || echo "vault")
+	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PATTERN_DIR)" -e secrets_backing_store="$(SECRETS_BACKING_STORE)" -e hide_sensitive_output=false $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.display_secrets_info"
 
 .PHONY: load-k8s-secrets
 load-k8s-secrets: ## Load secrets into Kubernetes backend
-	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.k8s_secrets"
+	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PATTERN_DIR)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.k8s_secrets"
 
 .PHONY: load-secrets
 load-secrets: ## Loads the secrets into the backend determined by values-global setting
 	SECRETS_BACKING_STORE=$(yq '.global.secretStore.backend' values-global.yaml 2>/dev/null || echo "vault")
-	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" -e secrets_backing_store="$SECRETS_BACKING_STORE" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.process_secrets"
+	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PATTERN_DIR)" -e secrets_backing_store="$SECRETS_BACKING_STORE" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.process_secrets"
 
 .PHONY: legacy-load-secrets
 legacy-load-secrets: ## Loads the secrets into vault (only)
-	ansible-playbook -t "push_secrets" -e pattern_name="$(NAME)" -e pattern_dir="$(PWD)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.vault"
+	ansible-playbook -t "push_secrets" -e pattern_name="$(NAME)" -e pattern_dir="$(PATTERN_DIR)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.vault"
 
 .PHONY: secrets-backend-vault
 secrets-backend-vault: ## Edits values files to use default Vault+ESO secrets config
