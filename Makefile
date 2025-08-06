@@ -265,8 +265,7 @@ load-k8s-secrets: ## Load secrets into Kubernetes backend
 
 .PHONY: load-secrets
 load-secrets: ## Loads the secrets into the backend determined by values-global setting
-	SECRETS_BACKING_STORE=$(yq '.global.secretStore.backend' values-global.yaml 2>/dev/null || echo "vault")
-	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PATTERN_DIR)" -e secrets_backing_store="$SECRETS_BACKING_STORE" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.process_secrets"
+	ansible-playbook -e pattern_name="$(NAME)" -e pattern_dir="$(PATTERN_DIR)" -e secrets_backing_store="$(SECRETS_BACKING_STORE)" $(EXTRA_PLAYBOOK_OPTS) "rhvp.cluster_utils.process_secrets"
 
 .PHONY: legacy-load-secrets
 legacy-load-secrets: ## Loads the secrets into vault (only)
@@ -274,31 +273,46 @@ legacy-load-secrets: ## Loads the secrets into vault (only)
 
 .PHONY: secrets-backend-vault
 secrets-backend-vault: ## Edits values files to use default Vault+ESO secrets config
-	yq -i '.global.secretStore.backend = "vault"' values-global.yaml
-	MAIN_CLUSTERGROUP=$(yq '.main.clusterGroupName' values-global.yaml)
-	MAIN_CLUSTERGROUP_FILE=values-$MAIN_CLUSTERGROUP.yaml
-	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets"))' "$MAIN_CLUSTERGROUP_FILE"
-	@RES=$(yq '.clusterGroup.applications[] | select(.chart == "hashicorp-vault")' "$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
-	if [ -z "$RES" ]; then
+	@yq -i '.global.secretStore.backend = "vault"' values-global.yaml
+	yq -i '.global.secretLoader.disabled = false' values-global.yaml
+	MAIN_CLUSTERGROUP=$$(yq '.main.clusterGroupName' values-global.yaml)
+	MAIN_CLUSTERGROUP_FILE="values-$$MAIN_CLUSTERGROUP.yaml"
+	yq -i 'del(.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets"))' "$$MAIN_CLUSTERGROUP_FILE"
+
+	RES=$$(yq '.clusterGroup.applications[] | select(.chart == "hashicorp-vault")' "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
 		echo "Adding vault application"
-		yq -i '.clusterGroup.applications.vault = {"name": "vault", "namespace": "vault", "project": "'$MAIN_CLUSTERGROUP'", "chart": "hashicorp-vault", "chartVersion": "0.1.*"}' "$MAIN_CLUSTERGROUP_FILE"
+		# Use double quotes on the outer expression to allow variable expansion
+		yq -i ".clusterGroup.applications.vault = {\"name\": \"vault\", \"namespace\": \"vault\", \"project\": \"$$MAIN_CLUSTERGROUP\", \"chart\": \"hashicorp-vault\", \"chartVersion\": \"0.1.*\"}" "$$MAIN_CLUSTERGROUP_FILE"
 	fi
-	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "vault")' "$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
-	if [ -z "$RES" ]; then
+
+	RES=$$(yq '.clusterGroup.namespaces[] | select(. == "vault")' "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
 		echo "Adding vault namespace"
-		yq -i '.clusterGroup.namespaces += ["vault"]' "$MAIN_CLUSTERGROUP_FILE"
+		yq -i '.clusterGroup.namespaces += ["vault"]' "$$MAIN_CLUSTERGROUP_FILE"
 	fi
-	@RES=$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
-	if [ -z "$RES" ]; then
+
+	RES=$$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
 		echo "Adding golang-external-secrets application"
-		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "'$MAIN_CLUSTERGROUP'", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$MAIN_CLUSTERGROUP_FILE"
+		# Use double quotes here as well
+		yq -i ".clusterGroup.applications.\"golang-external-secrets\" = {\"name\": \"golang-external-secrets\", \"namespace\": \"golang-external-secrets\", \"project\": \"$$MAIN_CLUSTERGROUP\", \"chart\": \"golang-external-secrets\", \"chartVersion\": \"0.1.*\"}" "$$MAIN_CLUSTERGROUP_FILE"
 	fi
-	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
-	if [ -z "$RES" ]; then
+
+	RES=$$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
 		echo "Adding golang-external-secrets namespace"
-		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$MAIN_CLUSTERGROUP_FILE"
+		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$$MAIN_CLUSTERGROUP_FILE"
 	fi
-	@git diff --exit-code || echo "Secrets backend set to vault, please review changes, commit, and push to activate in the pattern"
+
+	RES=$$(yq ".clusterGroup.projects[] | select(. == \"$$MAIN_CLUSTERGROUP\")" "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
+		echo "Adding $$MAIN_CLUSTERGROUP project"
+		yq -i ".clusterGroup.projects += [\"$$MAIN_CLUSTERGROUP\"]" "$$MAIN_CLUSTERGROUP_FILE"
+	fi
+
+	# This final command was missing from your snippet but is needed to complete the target
+	git diff --exit-code || echo "Secrets backend set to vault, please review changes, commit, and push to activate in the pattern"
 
 .PHONY: secrets-backend-kubernetes
 secrets-backend-kubernetes: ## Edits values file to use Kubernetes+ESO secrets config
@@ -353,23 +367,23 @@ secrets-backend-none: ## Edits values files to remove secrets manager + ESO
 .PHONY: validate-origin
 validate-origin: ## Verify the git origin is available
 	@echo "Checking repository:"
-	UPSTREAMURL=$(yq -r '.main.git.repoUpstreamURL // (.main.git.repoUpstreamURL = "")' values-global.yaml)
-	@if [ -z "$UPSTREAMURL" ]; then
+	UPSTREAMURL=$$(yq -r '.main.git.repoUpstreamURL // (.main.git.repoUpstreamURL = "")' values-global.yaml)
+	if [ -z "$$UPSTREAMURL" ]; then
 		echo -n "  $(TARGET_REPO) - branch '$(TARGET_BRANCH)': "
 		git ls-remote --exit-code --heads $(TARGET_REPO) $(TARGET_BRANCH) >/dev/null && echo "OK" || (echo "NOT FOUND"; exit 1)
 	else
-		echo "Upstream URL set to: $UPSTREAMURL"
-		echo -n "  $UPSTREAMURL - branch '$(TARGET_BRANCH)': "
-		git ls-remote --exit-code --heads $UPSTREAMURL $(TARGET_BRANCH) >/dev/null && echo "OK" || (echo "NOT FOUND"; exit 1)
+		echo "Upstream URL set to: $$UPSTREAMURL"
+		echo -n "  $$UPSTREAMURL - branch '$(TARGET_BRANCH)': "
+		git ls-remote --exit-code --heads $$UPSTREAMURL $(TARGET_BRANCH) >/dev/null && echo "OK" || (echo "NOT FOUND"; exit 1)
 	fi
 
 .PHONY: validate-cluster
 validate-cluster: ## Do some cluster validations before installing
 	@echo "Checking cluster:"
-	@echo -n "  cluster-info: "
-	@oc cluster-info >/dev/null && echo "OK" || (echo "Error"; exit 1)
-	@echo -n "  storageclass: "
-	@if [ $(oc get storageclass -o go-template='{{printf "%d\n" (len .items)}}') -eq 0 ]; then
+	echo -n "  cluster-info: "
+	oc cluster-info >/dev/null && echo "OK" || (echo "Error"; exit 1)
+	echo -n "  storageclass: "
+	if [ $$(oc get storageclass -o go-template='{{printf "%d\n" (len .items)}}') -eq 0 ]; then
 		echo "WARNING: No storageclass found"
 	else
 		echo "OK"
@@ -378,25 +392,25 @@ validate-cluster: ## Do some cluster validations before installing
 
 .PHONY: validate-schema
 validate-schema: ## Validates values files against schema in common/clustergroup
-	VAL_PARAMS=$(for i in ./values-*.yaml; do echo -n "$${i} "; done)
-	@echo -n "Validating clustergroup schema of: "
-	@set -e
-	for i in $VAL_PARAMS; do
-		echo -n " $i"
-		helm template oci://quay.io/hybridcloudpatterns/clustergroup $(HELM_OPTS) -f "$i" >/dev/null
+	@VAL_PARAMS=$$(for i in ./values-*.yaml; do echo -n "$${i} "; done)
+	echo -n "Validating clustergroup schema of: "
+	set -e
+	for i in $$VAL_PARAMS; do
+		echo -n " $$i"
+		helm template oci://quay.io/hybridcloudpatterns/clustergroup $(HELM_OPTS) -f "$$i" >/dev/null 2>&1
 	done
-	@echo
+	echo
 
 .PHONY: validate-prereq
 validate-prereq: ## Verify pre-requisites
-	GLOBAL_PATTERN=$(yq -r .global.pattern values-global.yaml)
-	@if [ $(NAME) != $GLOBAL_PATTERN ]; then
+	@GLOBAL_PATTERN=$$(yq -r .global.pattern values-global.yaml)
+	if [ $(NAME) != $$GLOBAL_PATTERN ]; then
 		echo ""
-		echo "WARNING: folder directory is \"$(NAME)\" and global.pattern is set to \"$GLOBAL_PATTERN\""
+		echo "WARNING: folder directory is \"$(NAME)\" and global.pattern is set to \"$$GLOBAL_PATTERN\""
 		echo "this can create problems. Please make sure they are the same!"
 		echo ""
 	fi
-	@if [ ! -f /run/.containerenv ]; then
+	if [ ! -f /run/.containerenv ]; then
 		echo "Checking prerequisites:"
 		echo -n "  Check for python-kubernetes: "
 		if ! ansible -m ansible.builtin.command -a "{{ ansible_python_interpreter }} -c 'import kubernetes'" localhost > /dev/null 2>&1; then echo "Not found"; exit 1; fi
@@ -406,8 +420,8 @@ validate-prereq: ## Verify pre-requisites
 		echo "OK"
 	else
 		if [ -f values-global.yaml ]; then
-			OUT=$(yq -r '.main.multiSourceConfig.enabled // (.main.multiSourceConfig.enabled = "false")' values-global.yaml)
-			if [ "${OUT,,}" = "false" ]; then
+			OUT=$$(yq -r '.main.multiSourceConfig.enabled // (.main.multiSourceConfig.enabled = "false")' values-global.yaml)
+			if [ "$${OUT,,}" = "false" ]; then
 				echo "You must set \".main.multiSourceConfig.enabled: true\" in your 'values-global.yaml' file"
 				echo "because your common subfolder is the slimmed down version with no helm charts in it"
 				exit 1
@@ -485,13 +499,7 @@ super-linter: ## Runs super linter locally
 					ghcr.io/super-linter/super-linter:slim-v7
 
 .PHONY: test
-test: ## Run schema validation tests using PATTERN_OPTS
-	MAIN_CLUSTERGROUP=$(yq '.main.clusterGroupName' values-global.yaml)
-	MAIN_CLUSTERGROUP_FILE=values-$MAIN_CLUSTERGROUP.yaml
-	PATTERN_OPTS=${PATTERN_OPTS:--f values-global.yaml -f $MAIN_CLUSTERGROUP_FILE}
-	@echo -n "Validating clustergroup schema with pattern options: "
-	@set -e; helm template oci://quay.io/hybridcloudpatterns/clustergroup $(HELM_OPTS) $PATTERN_OPTS >/dev/null
-	@echo "OK"
+test: validate-schema ## Run schema validation test
 
 .PHONY: deploy upgrade legacy-deploy legacy-upgrade
 deploy upgrade legacy-deploy legacy-upgrade:
