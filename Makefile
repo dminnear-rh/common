@@ -1,6 +1,6 @@
 .ONESHELL:
 
-NAME ?= $(shell basename "$(pwd)")
+NAME ?= $(shell basename "$(PWD)")
 
 ifneq ($(origin TARGET_SITE), undefined)
   TARGET_SITE_OPT=--set main.clusterGroupName=$(TARGET_SITE)
