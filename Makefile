@@ -20,6 +20,11 @@ ifeq ($(SECRETS_BACKING_STORE),null)
   SECRETS_BACKING_STORE=vault
 endif
 
+SECRET_LOADER_DISABLED ?= $(shell yq '.global.secretLoader.disabled' values-global.yaml 2>/dev/null)
+ifeq ($(SECRET_LOADER_DISABLED),null)
+  SECRET_LOADER_DISABLED=false
+endif
+
 # This variable can be set in order to pass additional helm arguments from the
 # the command line. I.e. we can set things without having to tweak values files
 EXTRA_HELM_OPTS ?=
@@ -220,28 +225,28 @@ operator-deploy operator-upgrade: validate-prereq $(VALIDATE_ORIGIN) validate-cl
 	@RUNS=10
 	WAIT=15
 	echo -n "Installing pattern: "
-	for i in $(seq 1 $RUNS); do
-		OUT=$(helm template --include-crds --name-template $(NAME) $(PATTERN_INSTALL_CHART) $(HELM_OPTS) 2>&1 | oc apply -f- 2>&1)
-		ret=$?
-		if [ $ret -eq 0 ]; then
+	for i in $$(seq 1 $$RUNS); do
+		OUT=$$(helm template --include-crds --name-template $(NAME) $(PATTERN_INSTALL_CHART) $(HELM_OPTS) 2>&1 | oc apply -f- 2>&1)
+		ret=$$?
+		if [ $$ret -eq 0 ]; then
 			break
 		else
 			echo -n "."
-			sleep "$WAIT"
+			sleep "$$WAIT"
 		fi
 	done
-	if [ $i -eq $RUNS ]; then
-		echo "Installation failed [$i/$RUNS]. Error:"
-		echo "$OUT"
+	if [ $$i -eq $$RUNS ]; then
+		echo "Installation failed [$$i/$$RUNS]. Error:"
+		echo "$$OUT"
 		exit 1
 	fi
 	echo "Done"
 
 .PHONY: uninstall
 uninstall: ## Runs helm uninstall
-	CSV=$(oc get subscriptions -n openshift-operators openshift-gitops-operator -ojsonpath={.status.currentCSV})
+	@CSV=$$(oc get subscriptions -n openshift-operators openshift-gitops-operator -ojsonpath={.status.currentCSV})
 	helm uninstall $(NAME)
-	@oc delete csv -n openshift-operators $CSV
+	oc delete csv -n openshift-operators $$CSV
 
 .PHONY: install
 install: operator-deploy post-install ## Installs the pattern and loads the secrets
@@ -316,46 +321,62 @@ secrets-backend-vault: ## Edits values files to use default Vault+ESO secrets co
 
 .PHONY: secrets-backend-kubernetes
 secrets-backend-kubernetes: ## Edits values file to use Kubernetes+ESO secrets config
-	yq -i '.global.secretStore.backend = "kubernetes"' values-global.yaml
-	MAIN_CLUSTERGROUP=$(yq '.main.clusterGroupName' values-global.yaml)
-	MAIN_CLUSTERGROUP_FILE=values-$MAIN_CLUSTERGROUP.yaml
-	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets")' "$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
-	if [ -z "$RES" ]; then
+	@yq -i '.global.secretStore.backend = "kubernetes"' values-global.yaml
+	yq -i '.global.secretLoader.disabled = false' values-global.yaml
+	MAIN_CLUSTERGROUP=$$(yq '.main.clusterGroupName' values-global.yaml)
+	MAIN_CLUSTERGROUP_FILE="values-$$MAIN_CLUSTERGROUP.yaml"
+
+	RES=$$(yq '.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets")' "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
 		echo "Adding validated-patterns-secrets namespace"
-		yq -i '.clusterGroup.namespaces += ["validated-patterns-secrets"]' "$MAIN_CLUSTERGROUP_FILE"
+		yq -i '.clusterGroup.namespaces += ["validated-patterns-secrets"]' "$$MAIN_CLUSTERGROUP_FILE"
 	fi
-	@echo "Removing vault application"
-	@yq -i 'del(.clusterGroup.applications[] | select(.chart == "hashicorp-vault"))' "$MAIN_CLUSTERGROUP_FILE"
-	@echo "Removing vault namespace"
-	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "vault"))' "$MAIN_CLUSTERGROUP_FILE"
-	@RES=$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
-	if [ -z "$RES" ]; then
+
+	echo "Removing vault application"
+	yq -i 'del(.clusterGroup.applications.vault)' "$$MAIN_CLUSTERGROUP_FILE"
+	echo "Removing vault namespace"
+	yq -i 'del(.clusterGroup.namespaces[] | select(. == "vault"))' "$$MAIN_CLUSTERGROUP_FILE"
+
+	RES=$$(yq '.clusterGroup.applications[] | select(.chart == "golang-external-secrets")' "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
 		echo "Adding golang-external-secrets application"
-		yq -i '.clusterGroup.applications."golang-external-secrets" = {"name": "golang-external-secrets", "namespace": "golang-external-secrets", "project": "'$MAIN_CLUSTERGROUP'", "chart": "golang-external-secrets", "chartVersion": "0.1.*"}' "$MAIN_CLUSTERGROUP_FILE"
+		# Use double quotes on the outer expression to allow variable expansion
+		yq -i ".clusterGroup.applications.\"golang-external-secrets\" = {\"name\": \"golang-external-secrets\", \"namespace\": \"golang-external-secrets\", \"project\": \"$$MAIN_CLUSTERGROUP\", \"chart\": \"golang-external-secrets\", \"chartVersion\": \"0.1.*\"}" "$$MAIN_CLUSTERGROUP_FILE"
 	fi
-	@RES=$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
-	if [ -z "$RES" ]; then
+
+	RES=$$(yq '.clusterGroup.namespaces[] | select(. == "golang-external-secrets")' "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
 		echo "Adding golang-external-secrets namespace"
-		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$MAIN_CLUSTERGROUP_FILE"
+		yq -i '.clusterGroup.namespaces += ["golang-external-secrets"]' "$$MAIN_CLUSTERGROUP_FILE"
 	fi
-	@git diff --exit-code || echo "Secrets backend set to kubernetes, please review changes, commit, and push to activate in the pattern"
+
+	RES=$$(yq ".clusterGroup.projects[] | select(. == \"$$MAIN_CLUSTERGROUP\")" "$$MAIN_CLUSTERGROUP_FILE" 2>/dev/null)
+	if [ -z "$$RES" ]; then
+		echo "Adding $$MAIN_CLUSTERGROUP project"
+		yq -i ".clusterGroup.projects += [\"$$MAIN_CLUSTERGROUP\"]" "$$MAIN_CLUSTERGROUP_FILE"
+	fi
+
+	git diff --exit-code || echo "Secrets backend set to kubernetes, please review changes, commit, and push to activate in the pattern"
 
 .PHONY: secrets-backend-none
 secrets-backend-none: ## Edits values files to remove secrets manager + ESO
-	yq -i '.global.secretStore.backend = "none"' values-global.yaml
-	MAIN_CLUSTERGROUP=$(yq '.main.clusterGroupName' values-global.yaml)
-	MAIN_CLUSTERGROUP_FILE=values-$MAIN_CLUSTERGROUP.yaml
-	@echo "Removing vault application"
-	@yq -i 'del(.clusterGroup.applications[] | select(.chart == "hashicorp-vault"))' "$MAIN_CLUSTERGROUP_FILE"
-	@echo "Removing golang-external-secrets application"
-	@yq -i 'del(.clusterGroup.applications[] | select(.chart == "golang-external-secrets"))' "$MAIN_CLUSTERGROUP_FILE"
-	@echo "Removing validated-patterns-secrets namespace"
-	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets"))' "$MAIN_CLUSTERGROUP_FILE"
-	@echo "Removing vault namespace"
-	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "vault"))' "$MAIN_CLUSTERGROUP_FILE"
-	@echo "Removing golang-external-secrets namespace"
-	@yq -i 'del(.clusterGroup.namespaces[] | select(. == "golang-external-secrets"))' "$MAIN_CLUSTERGROUP_FILE"
-	@git diff --exit-code || echo "Secrets backend set to none, please review changes, commit, and push to activate in the pattern"
+	@yq -i '.global.secretStore.backend = "none"' values-global.yaml
+	yq -i '.global.secretLoader.disabled = true' values-global.yaml
+	MAIN_CLUSTERGROUP=$$(yq '.main.clusterGroupName' values-global.yaml)
+	MAIN_CLUSTERGROUP_FILE=values-$$MAIN_CLUSTERGROUP.yaml
+
+	echo "Removing vault application"
+	yq -i 'del(.clusterGroup.applications[] | select(.chart == "hashicorp-vault"))' "$$MAIN_CLUSTERGROUP_FILE"
+	echo "Removing golang-external-secrets application"
+	yq -i 'del(.clusterGroup.applications[] | select(.chart == "golang-external-secrets"))' "$$MAIN_CLUSTERGROUP_FILE"
+	echo "Removing validated-patterns-secrets namespace"
+	yq -i 'del(.clusterGroup.namespaces[] | select(. == "validated-patterns-secrets"))' "$$MAIN_CLUSTERGROUP_FILE"
+	echo "Removing vault namespace"
+	yq -i 'del(.clusterGroup.namespaces[] | select(. == "vault"))' "$$MAIN_CLUSTERGROUP_FILE"
+	echo "Removing golang-external-secrets namespace"
+	yq -i 'del(.clusterGroup.namespaces[] | select(. == "golang-external-secrets"))' "$$MAIN_CLUSTERGROUP_FILE"
+
+	git diff --exit-code || echo "Secrets backend set to none, please review changes, commit, and push to activate in the pattern"
 
 
 ##@ Validation Tasks
@@ -433,7 +454,7 @@ validate-prereq: ## Verify pre-requisites
 argo-healthcheck: ## Checks if all argo applications are synced
 	@echo "Checking argo applications"
 	APPS=$(oc get applications.argoproj.io -A -o jsonpath='{range .items[*]}{@.metadata.namespace}{","}{@.metadata.name}{"\n"}{end}')
-	@NOTOK=0
+	NOTOK=0
 	for i in $APPS; do
 		n=$(echo "$i" | cut -f1 -d,)
 		a=$(echo "$i" | cut -f2 -d,)
@@ -478,7 +499,7 @@ qe-tests: ## Runs the tests that QE runs
 
 .PHONY: super-linter
 super-linter: ## Runs super linter locally
-	rm -rf .mypy_cache
+	@rm -rf .mypy_cache
 	podman run -e RUN_LOCAL=true -e USE_FIND_ALGORITHM=true \
 					-e VALIDATE_ANSIBLE=false \
 					-e VALIDATE_BASH=false \
